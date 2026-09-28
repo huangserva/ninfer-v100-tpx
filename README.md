@@ -69,7 +69,7 @@ NInfer 官方只支持 RTX 5090。社区的 [ninfer-v100](https://github.com/geo
 
 - 模型变体：每卡 12 个 q 头、2 个 kv 头，GDN 的 k/v 头减半，MLP 中间维度 8704。
 - `tp2_comm.cpp`：每层三类输出投影（attention 输出、GDN 输出、MLP down）之后的 all-reduce，放在 CUDA Graph 里。rank 0 把自己的一半加到残差上，rank 1 直接覆盖残差，再对残差做一次 all-reduce。
-- `tp2_mailbox.cu`：128KB 以下的消息不走 NCCL，改走 `/dev/shm` 上的锁页内存，每个线程块一个标志位，两卡按固定顺序相加，结果逐位相同。40KB 一次从 26 微秒降到 16。`NINFER_TP_MAILBOX=0` 退回全走 NCCL。
+- `tp2_mailbox.cu`：128KB 以下的消息不走 NCCL，改走 `/dev/shm` 上的锁页内存，每个线程块一个标志位，两卡按固定顺序相加，结果逐位相同。40KB 一次从 26 微秒降到 16。`NINFER_TP_MAILBOX=0` 退回全走 NCCL。两卡直连能用的机器（NVLink）上，信箱改放在显存里：每个进程通过 CUDA IPC 映射对方的收件箱，把数据和标志直接写进对方显存，只在自己显存上等；启动时自检并和主机信箱比一次速度，赢了才启用。NVLink 六条的机器上 40KB 一次 7.8 微秒，词表拼接从 335 微秒降到 27，生成快 9%。
 - LM head 和草稿 head 按词表切到两张卡，通过同一条路拼回完整 logits。`NINFER_TP_SHARD_HEADS=0` 关闭。
 - 散在 `src/ops/` 各处的十几处半宽形状登记（fp8 / nvfp4 / gdn / attn_input），以及 `d256-h12-kv2` 的 attention 几何路由。
 
@@ -145,6 +145,7 @@ python3 tools/tp2/tp2_proxy.py \
 | `NINFER_SM70_ATTN_V2` | 开 | 0 切回上游的生成 attention 内核 |
 | `NINFER_SM70_LONG_SPLIT_KEYS` | 双卡 1920，单卡沿用上游的 480 | 长上下文 attention 每段的 key 数，段太碎时合并步骤会成为大头。单卡设成 1920 时这个内核从 1402 微秒降到 1130（186K，T=4），还没有改成默认 |
 | `NINFER_TP_MAILBOX` | 开 | 0 让小消息也走 NCCL |
+| `NINFER_TP_NVLINK` | 自动 | 直连能用且比主机信箱快时把信箱放进显存（CUDA IPC）；0 强制关 |
 | `NINFER_TP_SHARD_HEADS` | 开 | 0 让两张卡各算完整词表 |
 | `NINFER_MTP_ATTN_WINDOW` | 0（关） | 猜词时只看最近 N 个 token。193K 中文能从 73 到 79，但代码的命中率从 0.72 掉到 0.59，所以默认关 |
 | `NINFER_TP_LOCKSTEP_TIMEOUT_S` | 300 | 等对方核对的超时 |
@@ -161,7 +162,7 @@ python3 tools/tp2/tp2_proxy.py \
 
 ## 路线图
 
-- NVLink 机器上的实测。按现在的拆分，双卡每轮 33 毫秒里卡间通信只占 2.2 毫秒，NVLink 对生成速度的帮助估计不到一成，对首字等待帮助更大。到货后补数据。
+- ~~NVLink 机器上的实测。~~ 已做（2× V100-SXM2，NVLink 六条，见 `docs/reproduce.md` 第 10 节）：NCCL 走直连只缩短首字等待；把信箱搬进显存后生成快 9%，186K 代码 105.7 tok/s、193K 中文 73.3，每轮 31.5 毫秒。这台卡的显存是 877 MHz（开发机 1107 MHz），单卡生成慢两成，双卡靠直连信箱反超。
 - 4 卡。
 - 中文长上下文到 80。
 

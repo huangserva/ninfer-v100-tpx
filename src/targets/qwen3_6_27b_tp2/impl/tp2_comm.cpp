@@ -34,8 +34,13 @@ namespace {
 ncclComm_t g_comm = nullptr;
 int g_rank        = -1;
 MailboxShared* g_mailbox_dev = nullptr;  // device alias of the shared host block (nullptr: NCCL only)
+MailboxShared* g_mailbox_host = nullptr; // host alias of the same block (bootstrap channel)
 std::uint64_t* g_mailbox_steps = nullptr;
 std::uint64_t* g_gather_steps  = nullptr;
+Inbox* g_inbox_mine            = nullptr;  // NVLink path (nullptr: host mailbox / NCCL)
+Inbox* g_inbox_peer            = nullptr;  // the peer's inbox, IPC-mapped
+std::uint64_t* g_nvlink_steps  = nullptr;
+std::uint64_t* g_nvlink_gather_steps = nullptr;
 __nv_bfloat16* g_head_local    = nullptr;  // [N/2, T] scratch for the sharded heads
 void* g_head_act               = nullptr;  // fp16 staging of the head activation (K x T <= 5120 x 32)
 
@@ -124,7 +129,122 @@ void init_mailbox(int rank, const std::string& path, std::uint64_t nonce) {
     CUDA_CHECK(cudaMemset(g_gather_steps, 0, sizeof(std::uint64_t) * kGatherMaxBlocks));
     CUDA_CHECK(cudaMalloc(&g_head_local, sizeof(__nv_bfloat16) * kGatherMaxElements));
     CUDA_CHECK(cudaMalloc(&g_head_act, sizeof(std::uint16_t) * 5120 * 32));
-    g_mailbox_dev = static_cast<MailboxShared*>(dev);
+    g_mailbox_dev  = static_cast<MailboxShared*>(dev);
+    g_mailbox_host = static_cast<MailboxShared*>(host);
+}
+
+// Times `iters` launches of `launch` on `stream`, in microseconds per launch.
+template <class F>
+double time_us(F&& launch, int iters, cudaStream_t stream) {
+    cudaEvent_t e0 = nullptr;
+    cudaEvent_t e1 = nullptr;
+    CUDA_CHECK(cudaEventCreate(&e0));
+    CUDA_CHECK(cudaEventCreate(&e1));
+    for (int i = 0; i < 50; ++i) { launch(); }
+    CUDA_CHECK(cudaEventRecord(e0, stream));
+    for (int i = 0; i < iters; ++i) { launch(); }
+    CUDA_CHECK(cudaEventRecord(e1, stream));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms = 0.F;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+    return static_cast<double>(ms) * 1000.0 / iters;
+}
+
+// NVLink inbox: allocate this rank's inbox, publish its IPC handle next to the mailbox file, map the
+// peer's, self-check, then race it against the host mailbox on a decode-sized message. Rank 0 makes
+// the on/off decision and publishes it through the host mailbox so both ranks always agree. Any
+// failure leaves the host mailbox in charge. `buffer` is a >= 128 KB device scratch, `stream` idle.
+void init_nvlink_inbox(int rank, const std::string& path, std::uint64_t nonce, void* buffer,
+                       cudaStream_t stream) {
+    struct Handle { std::uint64_t nonce; cudaIpcMemHandle_t handle; };
+    const int peer = 1 - rank;
+    Inbox* mine    = nullptr;
+    Inbox* theirs  = nullptr;
+    auto give_up = [&](const std::string& why) {
+        std::fprintf(stderr, "[ninfer] TP2 rank %d: NVLink inbox off (%s)\n", rank, why.c_str());
+        if (theirs != nullptr) { (void)cudaIpcCloseMemHandle(theirs); }
+        if (mine != nullptr) { (void)cudaFree(mine); }
+        (void)cudaGetLastError();
+    };
+    if (cudaMalloc(&mine, sizeof(Inbox)) != cudaSuccess) { give_up("cudaMalloc failed"); return; }
+    CUDA_CHECK(cudaMemset(mine, 0, sizeof(Inbox)));
+    Handle h{nonce, {}};
+    if (cudaIpcGetMemHandle(&h.handle, mine) != cudaSuccess) { give_up("cudaIpcGetMemHandle failed"); return; }
+    const std::string mine_path = path + ".ipc" + std::to_string(rank);
+    const std::string peer_path = path + ".ipc" + std::to_string(peer);
+    {
+        const std::string tmp = mine_path + ".tmp";
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&h), sizeof(h));
+        if (!out || std::rename(tmp.c_str(), mine_path.c_str()) != 0) { give_up("cannot publish " + mine_path); return; }
+    }
+    Handle ph{};
+    bool got = false;
+    for (int attempt = 0; attempt < 1200 && !got; ++attempt) {
+        std::ifstream in(peer_path, std::ios::binary);
+        if (in && in.read(reinterpret_cast<char*>(&ph), sizeof(ph)) && ph.nonce == nonce) { got = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!got) { give_up("timed out waiting for the peer's IPC handle"); return; }
+    const cudaError_t oe = cudaIpcOpenMemHandle(reinterpret_cast<void**>(&theirs), ph.handle,
+                                                cudaIpcMemLazyEnablePeerAccess);
+    if (oe != cudaSuccess) { theirs = nullptr; give_up(std::string("cudaIpcOpenMemHandle: ") + cudaGetErrorString(oe)); return; }
+    std::uint64_t* steps = nullptr;
+    std::uint64_t* gsteps = nullptr;
+    CUDA_CHECK(cudaMalloc(&steps, sizeof(std::uint64_t) * kMailboxMaxBlocks));
+    CUDA_CHECK(cudaMemset(steps, 0, sizeof(std::uint64_t) * kMailboxMaxBlocks));
+    CUDA_CHECK(cudaMalloc(&gsteps, sizeof(std::uint64_t) * kGatherMaxBlocks));
+    CUDA_CHECK(cudaMemset(gsteps, 0, sizeof(std::uint64_t) * kGatherMaxBlocks));
+
+    // Self-check: rank r contributes r + 1 everywhere, the sum must be exactly 3 on both ranks.
+    auto* x = static_cast<__nv_bfloat16*>(buffer);
+    const int n = kMailboxMaxElements;
+    std::vector<__nv_bfloat16> host(n, __float2bfloat16(static_cast<float>(rank + 1)));
+    bool ok = true;
+    for (int round = 0; round < 3 && ok; ++round) {
+        CUDA_CHECK(cudaMemcpyAsync(x, host.data(), n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, stream));
+        launch_nvlink_allreduce(x, n, rank, mine, theirs, steps, stream);
+        std::vector<__nv_bfloat16> out(n);
+        CUDA_CHECK(cudaMemcpyAsync(out.data(), x, n * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int i = 0; i < n; ++i) {
+            if (__bfloat162float(out[i]) != 3.0f) { ok = false; break; }
+        }
+    }
+    // Race on a decode-sized residual (4 tokens x 5120). Both ranks run the identical sequence.
+    const int probe = 20480;
+    const double nvl_us = time_us([&] { launch_nvlink_allreduce(x, probe, rank, mine, theirs, steps, stream); }, 500, stream);
+    const double mb_us  = g_mailbox_dev != nullptr
+        ? time_us([&] { launch_mailbox_allreduce(x, probe, rank, g_mailbox_dev, g_mailbox_steps, stream); }, 500, stream)
+        : 1.0e9;
+    // Rank 0 decides; rank 1 waits for the verdict in the shared host block (pad0[1]: 1 = on, 2 = off).
+    volatile std::uint64_t* verdict = &g_mailbox_host->pad0[1];
+    std::uint64_t decision = 0;
+    if (rank == 0) {
+        decision = (ok && nvl_us < mb_us && nvl_us < 100.0) ? 1 : 2;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *verdict = decision;
+    } else {
+        for (int attempt = 0; attempt < 6000 && *verdict == 0; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        decision = *verdict;
+    }
+    std::fprintf(stderr, "[ninfer] TP2 rank %d: NVLink inbox probe: nvlink %.1f us, host mailbox %.1f us per 40 KB all-reduce, self-check %s\n",
+                 rank, nvl_us, mb_us, ok ? "ok" : "FAILED");
+    if (decision != 1) {
+        CUDA_CHECK(cudaFree(steps));
+        CUDA_CHECK(cudaFree(gsteps));
+        give_up(rank == 0 ? "not faster than the host mailbox, or self-check failed" : "rank 0 decided");
+        return;
+    }
+    g_inbox_mine          = mine;
+    g_inbox_peer          = theirs;
+    g_nvlink_steps        = steps;
+    g_nvlink_gather_steps = gsteps;
+    std::fprintf(stderr, "[ninfer] TP2 rank %d: NVLink inbox on\n", rank);
 }
 
 void nccl_check(ncclResult_t result, const char* what) {
@@ -208,13 +328,19 @@ void init() {
                 }
             }
         }
+        // NVLink inbox on top of the mailbox (auto: probe and keep it only when it wins).
+        const char* nvlink_env = std::getenv("NINFER_TP_NVLINK");
+        if (nvlink_env == nullptr || nvlink_env[0] != '0') {
+            init_nvlink_inbox(rank, mailbox_path != nullptr ? mailbox_path : "/dev/shm/ninfer_tp2_mailbox",
+                              id_nonce(id), buffer, stream);
+        }
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUDA_CHECK(cudaFree(buffer));
     g_comm = comm;
     g_rank = rank;
-    std::fprintf(stderr, "[ninfer] TP2 rank %d/2 ready (NCCL %d, mailbox %s)\n", rank, NCCL_VERSION_CODE,
-                 g_mailbox_dev != nullptr ? "on" : "off");
+    std::fprintf(stderr, "[ninfer] TP2 rank %d/2 ready (NCCL %d, mailbox %s, nvlink %s)\n", rank, NCCL_VERSION_CODE,
+                 g_mailbox_dev != nullptr ? "on" : "off", g_inbox_peer != nullptr ? "on" : "off");
     // Create/attach the per-unit lockstep block now so both ranks agree on its lifetime.
     (void)::ninfer::runtime::tp::Lockstep::instance();
 }
@@ -225,6 +351,12 @@ void allreduce(Tensor& residual, cudaStream_t stream) {
     if (g_comm == nullptr) { throw std::logic_error("TP2 collectives used before init()"); }
     if (residual.dtype != DType::BF16 || !residual.is_contiguous()) {
         throw std::invalid_argument("TP2 all-reduce requires a contiguous BF16 tensor");
+    }
+    if (g_inbox_peer != nullptr && residual.numel() <= kMailboxMaxElements) {
+        launch_nvlink_allreduce(static_cast<__nv_bfloat16*>(residual.data),
+                                static_cast<int>(residual.numel()), g_rank, g_inbox_mine,
+                                g_inbox_peer, g_nvlink_steps, stream);
+        return;
     }
     if (g_mailbox_dev != nullptr && residual.numel() <= kMailboxMaxElements) {
         launch_mailbox_allreduce(static_cast<__nv_bfloat16*>(residual.data),
@@ -263,6 +395,11 @@ bool head_linear(const Tensor& hidden, const Weight& head, Tensor& out, cudaStre
         ops::detail::launch_fp8_volta_qpn_fp16(hidden, half, g_head_act, local, stream);
     } else {
         ops::linear(hidden, half, local, stream);
+    }
+    if (g_inbox_peer != nullptr) {
+        launch_nvlink_gather_rows(g_head_local, nh, t, static_cast<__nv_bfloat16*>(out.data), g_rank,
+                                  g_inbox_mine, g_inbox_peer, g_nvlink_gather_steps, stream);
+        return true;
     }
     launch_mailbox_gather_rows(g_head_local, nh, t, static_cast<__nv_bfloat16*>(out.data), g_rank,
                                g_mailbox_dev, g_gather_steps, stream);

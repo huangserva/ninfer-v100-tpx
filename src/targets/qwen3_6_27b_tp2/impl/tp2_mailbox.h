@@ -39,6 +39,25 @@ struct alignas(128) MailboxShared {
 void launch_mailbox_allreduce(__nv_bfloat16* x, int elements, int rank, MailboxShared* mailbox,
                               std::uint64_t* steps, cudaStream_t stream);
 
+// NVLink variant (machines whose two GPUs have working peer access). Each rank owns one Inbox in
+// its own device memory and maps the peer's through a CUDA IPC handle. A rank pushes its slice and
+// then its flag straight into the peer's inbox, so it only ever spins on its own memory; the data
+// travels once over NVLink instead of twice over PCIe through host memory. Same slice/step/parity
+// protocol as the host mailbox, same rank-ordered add, so the result is bit-identical to it.
+struct alignas(128) Inbox {
+    std::uint64_t flag[kMailboxMaxBlocks][16];      // [block], 128 B apart
+    __nv_bfloat16 data[2][kMailboxMaxElements];     // [parity][elements]
+    std::uint64_t gflag[kGatherMaxBlocks][16];
+    __nv_bfloat16 gdata[2][kGatherMaxElements];
+};
+
+void launch_nvlink_allreduce(__nv_bfloat16* x, int elements, int rank, Inbox* mine, Inbox* peer,
+                             std::uint64_t* steps, cudaStream_t stream);
+
+void launch_nvlink_gather_rows(const __nv_bfloat16* local, int local_rows, int t,
+                               __nv_bfloat16* out, int rank, Inbox* mine, Inbox* peer,
+                               std::uint64_t* steps, cudaStream_t stream);
+
 // out[N, T] (leading dimension N = 2 * local_rows) <- both ranks' local [local_rows, T] blocks.
 void launch_mailbox_gather_rows(const __nv_bfloat16* local, int local_rows, int t,
                                 __nv_bfloat16* out, int rank, MailboxShared* mailbox,
