@@ -122,7 +122,7 @@ python3 tools/tp2/tp2_proxy.py \
   --model-prefix /path/to/models-tp2/qwen3_8_27b_nvfp4 \
   --api-key-file /path/to/api-key --log-dir ./logs --gpus 0,1 -- \
   --model-id qwen38-ninfer --max-context 262144 --kv-capacity auto \
-  --max-concurrency 1 --prefill-chunk 2048 --kv-dtype int8 \
+  --max-concurrency 1 --prefill-chunk 4096 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft --vision --seed 42
 ```
 
@@ -147,7 +147,7 @@ python3 tools/tp2/tp2_proxy.py \
 | `NINFER_TP_MAILBOX` | 开 | 0 让小消息也走 NCCL |
 | `NINFER_TP_NVLINK` | 自动 | 直连能用且比主机信箱快时把信箱放进显存（CUDA IPC）；0 强制关 |
 | `NINFER_TP_SHARD_HEADS` | 开 | 0 让两张卡各算完整词表 |
-| `NINFER_MTP_ATTN_WINDOW` | 0（关） | 猜词时只看最近 N 个 token。193K 中文能从 73 到 79，但代码的命中率从 0.72 掉到 0.59，所以默认关 |
+| `NINFER_MTP_ATTN_WINDOW` | 0（关） | 猜词时只看最近 N 个 token。193K 中文能从 73 到 79，但代码的命中率从 0.72 掉到 0.59，所以默认关。NVLink 机器上复测 4096：186K 中文快 3% 到 6%，128K 中文反而慢 3%，仍然默认关 |
 | `NINFER_TP_LOCKSTEP_TIMEOUT_S` | 300 | 等对方核对的超时 |
 
 `NINFER_TP_RANK`、`NINFER_TP_ID_FILE`、`NINFER_TP_LOCKSTEP_FILE`、`NINFER_TP_MAILBOX_FILE` 由代理设置，不用手动管。

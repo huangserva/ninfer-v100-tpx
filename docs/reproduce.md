@@ -121,7 +121,7 @@ python3 tools/tp2/tp2_proxy.py \
   --model-prefix models-tp2/qwen3_8_27b_nvfp4 \
   --api-key-file api-key --log-dir ./logs --gpus 0,1 --nccl-p2p off -- \
   --model-id qwen38-ninfer --max-context 262144 --kv-capacity auto \
-  --max-concurrency 1 --prefill-chunk 2048 --kv-dtype int8 \
+  --max-concurrency 1 --prefill-chunk 4096 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft --vision --seed 42
 ```
 
@@ -251,6 +251,12 @@ CUDA_VISIBLE_DEVICES=1 ./nvl_bench 1 & CUDA_VISIBLE_DEVICES=0 ./nvl_bench 0
 | 直连信箱 | 135.6 / 106.1 | 22.8 | 105.7 / 73.3 | 31.5 | 194 s |
 
 长上下文看每轮毫秒（提示词偏移不同，tok/s 不完全同口径）：128K 从 30.9 降到 29.3，256K 从 38.0 降到 35.9，省下的 2 毫秒左右在各档都在。直连信箱之后，这台显存 877 MHz 的机器头条两档都超过了第一台（显存 1107 MHz，无直连）的 101.9 / 73.4。8K 数字是 2 个缓存种子的平均、512 token；12 个功能场景、杀进程和冻结进程两种故障注入都通过，进程重启后直连信箱会重新协商。
+
+**prefill 块用 4096。** 第二台机器上量过三档，128K 代码首字等待：2048 是 117 秒，4096 是 100 秒，8192 反而 138 秒；中文 123 / 112 / 147 秒；4096 在 186K 代码是 184 秒（2048 是 194），256K 是 332 秒（346）。生成每轮耗时不受影响，KV 容量不变（262,144），显存只多占 0.2GB。所以上面的启动命令写 4096；老机器没有重测，按理一样。
+
+**猜词窗口 `NINFER_MTP_ATTN_WINDOW` 不开。** 在第二台机器上试了 4096 和 16384：186K 中文快 3% 到 6%，186K 代码不变；到 128K 中文反而慢 3%，代码快 3%。两头互相抵消，还多一个开关要解释，默认关。
+
+**另一种猜词方式 `--spec dflash2` 试不了。** 模型文件里没有它的权重（`dflash2/feature_projection` 那组张量不在 artifact 里），启动会报 `DFlash2 was selected but the artifact has no DFlash2 weight bundle`。要试得另外拿到带 dflash2 权重的 artifact 再切分。
 
 **草稿词数别动。** 在这台机器上试过把 `--draft-tokens` 从 3 调到 4、5、6：8K 代码 5 比 3 快 9%，中文慢 10%；到 128K 以上全面变慢（128K 代码 110 降到 87，186K 从 96 降到 65，每轮从 31 毫秒涨到 52 和 66），因为每轮验证的词数超过 4 之后长上下文 attention 走了慢路径。保持 3。
 
