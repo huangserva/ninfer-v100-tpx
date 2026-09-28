@@ -49,7 +49,17 @@ struct alignas(128) Inbox {
     __nv_bfloat16 data[2][kMailboxMaxElements];     // [parity][elements]
     std::uint64_t gflag[kGatherMaxBlocks][16];
     __nv_bfloat16 gdata[2][kGatherMaxElements];
+    // LL all-reduce: 8-byte words {bf16x2 data, u32 step}; the flag travels with the data, so no
+    // fence and no separate flag round trip (NCCL's LL protocol idea). [parity][word]
+    std::uint64_t ll[2][kMailboxMaxElements / 2];
 };
+
+// LL variant of the NVLink all-reduce: twice the bytes, one less round trip; measured faster than
+// the push kernel for every decode message size on NVLink (40 KB: 5.6 us vs 7.8 us in a graph).
+// Plain volatile 8-byte stores/loads: on Volta, st.cg to peer memory paired with ld.cv on the
+// receiver never became visible.
+void launch_nvlink_ll_allreduce(__nv_bfloat16* x, int elements, int rank, Inbox* mine, Inbox* peer,
+                                std::uint64_t* steps, cudaStream_t stream);
 
 void launch_nvlink_allreduce(__nv_bfloat16* x, int elements, int rank, Inbox* mine, Inbox* peer,
                              std::uint64_t* steps, cudaStream_t stream);

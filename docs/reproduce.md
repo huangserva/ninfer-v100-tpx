@@ -255,7 +255,11 @@ nvcc -O2 -arch=sm_70 -std=c++17 -o nvl_bench tools/bench/v100/nvl_bench.cu
 CUDA_VISIBLE_DEVICES=1 ./nvl_bench 1 & CUDA_VISIBLE_DEVICES=0 ./nvl_bench 0
 ```
 
-预期（NVLink 六条，CUDA Graph 里）：40KB all-reduce 主机信箱 21.8 微秒、直连 7.8；词表拼接 4 列（1MB）主机信箱 335 微秒、直连 27。一轮生成里有 130 多次交换，合计省 2 毫秒多。
+预期（NVLink 六条，CUDA Graph 里）：40KB all-reduce 主机信箱 21.8 微秒、直连推送 7.8、直连 LL 5.6；词表拼接 4 列（1MB）主机信箱 335 微秒、直连 27。一轮生成里有 130 多次交换，合计省 2 毫秒多。
+
+直连有两个内核：推送版（数据、栅栏、标志三步）和 LL 版（8 字节一个词，4 字节数据带 4 字节步号，读的一方逐词等步号对上，没有栅栏也没有单独的标志往返，NCCL 的 LL 协议思路）。启动时两个都自检，再在 CUDA Graph 里各计时一次（必须在 Graph 里比，流上发射的开销会把两者的差抹平），选快的那个。NVLink 六条的机器上 LL 赢：8K 一轮从 22.8 毫秒到 22.4，输出逐位不变。日志里是 `NVLink inbox on (LL all-reduce)`。LL 版写对方显存必须用 volatile 的 8 字节存取，Volta 上 `st.cg` 配 `ld.cv` 的组合对方永远读不到。
+
+一轮里两卡互相等的时间也量过（nsys，134 次交换）：每次最短 7.2 微秒、中位 9.0，差的 1.8 微秒是两张卡的快慢抖动，任何协议都省不掉。
 
 第二台机器的对比（`auto`，信箱开，草稿词数 3）：
 
@@ -271,6 +275,8 @@ CUDA_VISIBLE_DEVICES=1 ./nvl_bench 1 & CUDA_VISIBLE_DEVICES=0 ./nvl_bench 0
 **猜词窗口 `NINFER_MTP_ATTN_WINDOW` 不开。** 在第二台机器上试了 4096 和 16384：186K 中文快 3% 到 6%，186K 代码不变；到 128K 中文反而慢 3%，代码快 3%。两头互相抵消，还多一个开关要解释，默认关。
 
 **另一种猜词方式 `--spec dflash2` 试不了。** 模型文件里没有它的权重（`dflash2/feature_projection` 那组张量不在 artifact 里），启动会报 `DFlash2 was selected but the artifact has no DFlash2 weight bundle`。要试得另外拿到带 dflash2 权重的 artifact 再切分。
+
+**矩阵乘内核的一次对照（没有采用）。** 双卡 down 投影（8704 到 5120）只有 160 个线程块摊 80 个 SM，试过把它从 8 路切 K 换成 16 路（`nvfp4_volta_qpn_gemm.cuh` 里 `launch_nvfp4_volta_qpn_with_activation` 的形状判断），8K 一轮反而从 22.4 涨到 22.7 毫秒，而且累加顺序变了、输出不再逐位一致，已撤回。按 nsys 的内核耗时算，fp8 那组投影已经跑到显存带宽的九成以上，nvfp4 的 MLP 在七成出头，再往上要 Nsight Compute 的计数器看瓶颈；这台机器要先开权限：`/etc/modprobe.d/` 里加 `options nvidia NVreg_RestrictProfilingToAdminUsers=0` 后重载驱动，否则 `ncu` 报 `ERR_NVGPUCTRPERM`。
 
 **草稿词数别动。** 在这台机器上试过把 `--draft-tokens` 从 3 调到 4、5、6：8K 代码 5 比 3 快 9%，中文慢 10%；到 128K 以上全面变慢（128K 代码 110 降到 87，186K 从 96 降到 65，每轮从 31 毫秒涨到 52 和 66），因为每轮验证的词数超过 4 之后长上下文 attention 走了慢路径。保持 3。
 

@@ -138,6 +138,39 @@ __global__ void nvlink_allreduce_kernel(__nv_bfloat16* x, int n, int rank, Inbox
     if (threadIdx.x == 0) { steps[blk] = step; }
 }
 
+__global__ void nvlink_ll_allreduce_kernel(__nv_bfloat16* x, int n, int rank, Inbox* mine, Inbox* peer,
+                                           std::uint64_t* steps) {
+    const int blk            = static_cast<int>(blockIdx.x);
+    const std::uint64_t step = steps[blk] + 1;
+    const int parity         = static_cast<int>(step & 1);
+    const std::uint32_t flag = static_cast<std::uint32_t>(step);
+    const int base           = blk * (kMailboxSlice / 2);              // words of two bf16
+    const int end            = min(n / 2, base + kMailboxSlice / 2);
+    const std::uint32_t* xw  = reinterpret_cast<const std::uint32_t*>(x);
+    for (int w = base + static_cast<int>(threadIdx.x); w < end; w += blockDim.x) {
+        const unsigned long long v = (static_cast<unsigned long long>(flag) << 32) | xw[w];
+        *reinterpret_cast<volatile unsigned long long*>(&peer->ll[parity][w]) = v;
+    }
+    for (int w = base + static_cast<int>(threadIdx.x); w < end; w += blockDim.x) {
+        unsigned long long v;
+        const long long start = clock64();
+        do {
+            v = *reinterpret_cast<volatile const unsigned long long*>(&mine->ll[parity][w]);
+            if (clock64() - start > 83'000'000'000LL) { __trap(); }
+        } while (static_cast<std::uint32_t>(v >> 32) != flag);
+        const std::uint32_t other = static_cast<std::uint32_t>(v);
+        const __nv_bfloat162 a    = *reinterpret_cast<const __nv_bfloat162*>(&xw[w]);
+        const __nv_bfloat162 b    = *reinterpret_cast<const __nv_bfloat162*>(&other);
+        const float2 fa           = __bfloat1622float2(a);
+        const float2 fb           = __bfloat1622float2(b);
+        // rank 0's value first on both ranks: identical rounding everywhere
+        const float2 s = rank == 0 ? make_float2(fa.x + fb.x, fa.y + fb.y)
+                                   : make_float2(fb.x + fa.x, fb.y + fa.y);
+        reinterpret_cast<__nv_bfloat162*>(x)[w] = __float22bfloat162_rn(s);
+    }
+    if (threadIdx.x == 0) { steps[blk] = step; }
+}
+
 __global__ void nvlink_gather_rows_kernel(const __nv_bfloat16* local, int nh, int t,
                                           __nv_bfloat16* out, int rank, Inbox* mine, Inbox* peer,
                                           std::uint64_t* steps) {
@@ -192,6 +225,13 @@ void launch_nvlink_allreduce(__nv_bfloat16* x, int elements, int rank, Inbox* mi
                              std::uint64_t* steps, cudaStream_t stream) {
     const int blocks = (elements + kMailboxSlice - 1) / kMailboxSlice;
     nvlink_allreduce_kernel<<<blocks, 64, 0, stream>>>(x, elements, rank, mine, peer, steps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_nvlink_ll_allreduce(__nv_bfloat16* x, int elements, int rank, Inbox* mine, Inbox* peer,
+                                std::uint64_t* steps, cudaStream_t stream) {
+    const int blocks = (elements + kMailboxSlice - 1) / kMailboxSlice;
+    nvlink_ll_allreduce_kernel<<<blocks, 64, 0, stream>>>(x, elements, rank, mine, peer, steps);
     CUDA_CHECK(cudaGetLastError());
 }
 

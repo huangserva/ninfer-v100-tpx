@@ -69,7 +69,7 @@ NInfer 官方只支持 RTX 5090。社区的 [ninfer-v100](https://github.com/geo
 
 - 模型变体：每卡 12 个 q 头、2 个 kv 头，GDN 的 k/v 头减半，MLP 中间维度 8704。
 - `tp2_comm.cpp`：每层三类输出投影（attention 输出、GDN 输出、MLP down）之后的 all-reduce，放在 CUDA Graph 里。rank 0 把自己的一半加到残差上，rank 1 直接覆盖残差，再对残差做一次 all-reduce。
-- `tp2_mailbox.cu`：128KB 以下的消息不走 NCCL，改走 `/dev/shm` 上的锁页内存，每个线程块一个标志位，两卡按固定顺序相加，结果逐位相同。40KB 一次从 26 微秒降到 16。`NINFER_TP_MAILBOX=0` 退回全走 NCCL。两卡直连能用的机器（NVLink）上，信箱改放在显存里：每个进程通过 CUDA IPC 映射对方的收件箱，把数据和标志直接写进对方显存，只在自己显存上等；启动时自检并和主机信箱比一次速度，赢了才启用。NVLink 六条的机器上 40KB 一次 7.8 微秒，词表拼接从 335 微秒降到 27，生成快 9%。
+- `tp2_mailbox.cu`：128KB 以下的消息不走 NCCL，改走 `/dev/shm` 上的锁页内存，每个线程块一个标志位，两卡按固定顺序相加，结果逐位相同。40KB 一次从 26 微秒降到 16。`NINFER_TP_MAILBOX=0` 退回全走 NCCL。两卡直连能用的机器（NVLink）上，信箱改放在显存里：每个进程通过 CUDA IPC 映射对方的收件箱，把数据和标志直接写进对方显存，只在自己显存上等；启动时自检并和主机信箱比一次速度，赢了才启用。NVLink 六条的机器上 40KB 一次 7.8 微秒（LL 版 5.6，启动时在 Graph 里比一次取快的），词表拼接从 335 微秒降到 27，生成快 9% 到 10%。
 - LM head 和草稿 head 按词表切到两张卡，通过同一条路拼回完整 logits。`NINFER_TP_SHARD_HEADS=0` 关闭。
 - 散在 `src/ops/` 各处的十几处半宽形状登记（fp8 / nvfp4 / gdn / attn_input），以及 `d256-h12-kv2` 的 attention 几何路由。
 
