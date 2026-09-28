@@ -144,6 +144,20 @@ python3 tools/bench/v100/tp2_scenarios.py --port 18881 --model qwen38-ninfer --k
 
 预期：12 行都是 `[PASS]`，每行 `units=(a, b)` 两个数相等，最后一行 `ALL PASS`。
 
+**两个请求同时生成（2026-09-28 加）。** 代理原来一次只放一个请求。现在 `--max-inflight 2`（`run_tp2.sh` 里 `CONC` 变量，默认 2）加上 rank 的 `--max-concurrency 2`，两个请求一起进入解码轮。两卡怎么保持一致：代理把每个请求按同一顺序发给两个 rank（发完隔 5 毫秒再发下一个）；引擎在每个 GPU 单元交换时附上自己队列里等着的请求数，双方按少的那个数放行，没有单元在跑时用一次单独的"准入交换"取数。这样一个请求先到了 0 号、还没到 1 号，谁也不会先放。排队中的请求断连不再单方面丢弃，而是照常放行，由每单元的取消掩码统一取消。
+
+验证（8K，512 token）：
+
+```bash
+python3 tools/bench/v100/tp2_conc.py load --n 2 --level 8K --tokens 512 --rounds 3   # 两个人同时用
+python3 tools/bench/v100/tp2_conc.py stress --rounds 10 --n 4 --tokens 48            # 四个请求同时砸过来
+python3 tools/bench/v100/tp2_conc.py drop --level 8K                                 # 一个中途断连
+```
+
+预期：两个提示词都命中缓存时各 100 tok/s 上下（单人 136），合计 200；两个都要读提示词时 14 秒全部出完（串行 19 秒）；`stress` 二十轮全 200，四个位置的 tok/s 每轮一样（说明批次组成每轮相同）；`drop` 里另一个请求照常出满，后续请求正常；第 8 节的杀进程测试在两个请求在飞时做，两个都收到 503，恢复照旧。核对日志 `LOCKSTEP FAILURE` 为 0。
+
+已知：一个请求在读长提示词的阶段不放新请求进来（调度规则里 `prefill_lane` 占着就不准入），128K 的提示词会让后面的人等约 100 秒，读完后两条一起生成，128K 加 8K 一轮约 36 毫秒。
+
 ## 8. 故障注入
 
 ```bash

@@ -2,8 +2,9 @@
 """Front proxy + supervisor for two-process TP2 ninfer-serve (stdlib only).
 
 * Starts rank 0 and rank 1 (one GPU each), waits until both answer /v1/models.
-* Serialises generation requests; each request body is sent unchanged to both ranks. Rank 0's
-  response is relayed to the client; rank 1's is drained and discarded.
+* Runs up to --max-inflight generation requests at once (the ranks need --max-concurrency of at
+  least that); each request body is sent unchanged to both ranks, in the same order for both, so
+  their FIFOs agree. Rank 0's response is relayed to the client; rank 1's is drained and discarded.
 * A client disconnect closes only the rank-0 upstream connection. The engines agree on
   cancellation once per GPU unit (runtime/engine/tp_lockstep.h), so rank 1 stops at the same unit.
 * Watchdog: if either process exits, or a request is in flight and the lockstep unit counters do
@@ -26,7 +27,10 @@ class Supervisor:
         self.args = args
         self.procs = [None, None]
         self.ready = threading.Event()
-        self.lock = threading.Lock()          # serialises generation requests
+        self.slots = threading.BoundedSemaphore(args.max_inflight)  # generation requests in flight
+        self.inflight = 0
+        self.dispatch_lock = threading.Lock()  # both ranks must receive requests in the same order
+        self.restart_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.generation = 0
         self.restarts = 0
@@ -97,15 +101,18 @@ class Supervisor:
                     except subprocess.TimeoutExpired:
                         pass
 
-    def restart(self, reason):
-        log(f"RESTART both ranks: {reason}")
-        self.restarts += 1
-        self.ready.clear()
-        self.kill_all()
-        time.sleep(2)
-        while not self.start():
+    def restart(self, reason, gen=None):
+        with self.restart_lock:
+            if gen is not None and self.generation != gen:
+                return  # another in-flight request already restarted this generation
+            log(f"RESTART both ranks: {reason}")
+            self.restarts += 1
+            self.ready.clear()
             self.kill_all()
-            time.sleep(10)
+            time.sleep(2)
+            while not self.start():
+                self.kill_all()
+                time.sleep(10)
 
     def probe(self, r):
         try:
@@ -188,18 +195,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not sup.ready.wait(timeout=sup.args.ready_wait):
             return self._error(503, "TP2 backend is restarting")
         with sup.count_lock:
-            if sup.waiting >= sup.args.max_waiting + 1:
+            if sup.waiting >= sup.args.max_waiting + sup.args.max_inflight:
                 return self._error(429, "too many queued requests")
             sup.waiting += 1
         try:
-            if not sup.lock.acquire(timeout=sup.args.pending_timeout):
+            if not sup.slots.acquire(timeout=sup.args.pending_timeout):
                 return self._error(503, "request expired while waiting for admission")
             try:
                 if not sup.ready.is_set() or not sup.alive():
                     return self._error(503, "TP2 backend is restarting")
-                self._generate(body)
+                with sup.count_lock:
+                    sup.inflight += 1
+                try:
+                    self._generate(body)
+                finally:
+                    with sup.count_lock:
+                        sup.inflight -= 1
             finally:
-                sup.lock.release()
+                sup.slots.release()
         finally:
             with sup.count_lock:
                 sup.waiting -= 1
@@ -211,8 +224,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers["Content-Length"] = str(len(body))
         conns = [http.client.HTTPConnection("127.0.0.1", sup.args.rank_ports[r], timeout=None)
                  for r in (0, 1)]
-        for r in (0, 1):
-            conns[r].request("POST", self.path, body=body, headers=headers)
+        with sup.dispatch_lock:
+            for r in (0, 1):
+                conns[r].request("POST", self.path, body=body, headers=headers)
+            # Let both engines queue this request before the next one is dispatched, so the two
+            # FIFOs hold the same order (the engines agree on how many to admit, not on which).
+            time.sleep(sup.args.dispatch_gap)
         failure = {"reason": None}
         done = [threading.Event(), threading.Event()]
         upstream_socks = [conns[0].sock, conns[1].sock]
@@ -330,7 +347,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._error(503, f"TP2 backend failed: {failure['reason']}")
             else:
                 self.close_connection = True
-            sup.restart(failure["reason"])
+            sup.restart(failure["reason"], gen)
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -353,8 +370,13 @@ def main():
     ap.add_argument("--ready-wait", type=int, default=600)
     ap.add_argument("--api-key-file", required=True,
                     help="bearer key: passed to both ranks and used for health probes")
+    ap.add_argument("--max-inflight", type=int, default=1,
+                    help="generation requests running at once; start the ranks with "
+                         "--max-concurrency >= this")
+    ap.add_argument("--dispatch-gap", type=float, default=0.005,
+                    help="seconds between dispatching consecutive requests to the ranks")
     ap.add_argument("--max-waiting", type=int, default=4,
-                    help="generation requests allowed to queue behind the running one")
+                    help="generation requests allowed to queue behind the running ones")
     ap.add_argument("--pending-timeout", type=int, default=600,
                     help="seconds a queued generation request may wait")
     ap.add_argument("--log-dir", default=".")
@@ -389,12 +411,11 @@ def main():
     # Idle watchdog: restart if a rank dies while no request holds the lock.
     while True:
         time.sleep(5)
-        if sup.ready.is_set() and not sup.alive() and sup.lock.acquire(blocking=False):
-            try:
-                if not sup.alive():
-                    sup.restart("a rank process exited while idle")
-            finally:
-                sup.lock.release()
+        if sup.ready.is_set() and not sup.alive():
+            with sup.count_lock:
+                idle = sup.inflight == 0
+            if idle:
+                sup.restart("a rank process exited while idle")
 
 
 if __name__ == "__main__":

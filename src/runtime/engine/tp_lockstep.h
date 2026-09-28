@@ -11,6 +11,7 @@
 // supervisor deletes it before (re)starting both ranks. Enabled only when NINFER_TP_RANK and
 // NINFER_TP_LOCKSTEP_FILE are both set.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -28,7 +29,7 @@
 
 namespace ninfer::runtime::tp {
 
-enum class UnitKind : std::uint64_t { Prefill = 1, Decode = 2 };
+enum class UnitKind : std::uint64_t { Prefill = 1, Decode = 2, Admission = 3 };
 
 struct alignas(64) Record {
     std::uint64_t seq;
@@ -37,7 +38,8 @@ struct alignas(64) Record {
     std::uint64_t count;
     std::uint64_t hash;
     std::uint64_t position;
-    std::uint64_t pad[2];
+    std::uint64_t pending;   // requests waiting in this rank's FIFO when the unit was exchanged
+    std::uint64_t pad[1];
 };
 
 struct alignas(64) SharedBlock {
@@ -72,12 +74,70 @@ class Lockstep {
 
     // Publishes this rank's view of the unit, waits for the peer's, verifies both describe the same
     // unit and result, and returns the OR of both cancellation masks.
+    // `pending` is this rank's FIFO length; the peer's is readable afterwards through
+    // peer_pending(), and the smaller of the two is what both ranks may admit next.
     std::uint64_t exchange(UnitKind kind, std::uint64_t cancel_mask, std::uint64_t count,
-                           std::uint64_t hash, std::uint64_t position) {
+                           std::uint64_t hash, std::uint64_t position, std::uint64_t pending = 0) {
         const std::uint64_t seq = ++seq_;
         if (fault_unit_ != 0 && seq == fault_unit_) { hash ^= 0x5a5a5a5aULL; }  // test hook
-        Record& mine            = block_->records[rank_][seq & 1];
-        mine = Record{seq, static_cast<std::uint64_t>(kind), cancel_mask, count, hash, position, {}};
+        const Record mine{seq, static_cast<std::uint64_t>(kind), cancel_mask, count, hash, position,
+                          pending, {}};
+        const Record theirs = publish_and_wait(mine);
+        if (theirs.seq != seq || theirs.kind != mine.kind || theirs.count != mine.count ||
+            theirs.hash != mine.hash || theirs.position != mine.position) {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                          "unit %llu diverged: kind %llu/%llu count %llu/%llu hash %016llx/%016llx "
+                          "position %llu/%llu (rank%d/peer)",
+                          static_cast<unsigned long long>(seq),
+                          static_cast<unsigned long long>(mine.kind),
+                          static_cast<unsigned long long>(theirs.kind),
+                          static_cast<unsigned long long>(mine.count),
+                          static_cast<unsigned long long>(theirs.count),
+                          static_cast<unsigned long long>(mine.hash),
+                          static_cast<unsigned long long>(theirs.hash),
+                          static_cast<unsigned long long>(mine.position),
+                          static_cast<unsigned long long>(theirs.position), rank_);
+            lockstep_fatal(buf);
+        }
+        peer_pending_ = theirs.pending;
+        return cancel_mask | theirs.cancel_mask;
+    }
+
+    // Admission agreement while no GPU unit is flowing (Engine::worker_loop): both ranks publish
+    // how many requests wait in their FIFO and may admit the smaller number. The counts may differ
+    // (a request reaches the two processes at slightly different times); only the kind must match.
+    std::uint64_t agree_admissions(std::uint64_t pending) {
+        const std::uint64_t seq = ++seq_;
+        const Record mine{seq, static_cast<std::uint64_t>(UnitKind::Admission), 0, pending, 0, 0,
+                          pending, {}};
+        const Record theirs = publish_and_wait(mine);
+        if (theirs.seq != seq || theirs.kind != mine.kind) {
+            lockstep_fatal("admission exchange " + std::to_string(seq) + " met unit kind " +
+                           std::to_string(theirs.kind) + " on the peer");
+        }
+        peer_pending_ = theirs.pending;
+        return std::min(pending, theirs.pending);
+    }
+
+    [[nodiscard]] std::uint64_t peer_pending() const noexcept { return peer_pending_; }
+
+    template <class T>
+    static std::uint64_t hash_tokens(std::span<const T> tokens,
+                                     std::uint64_t h = 1469598103934665603ULL) noexcept {
+        for (const T t : tokens) {
+            h ^= static_cast<std::uint32_t>(t);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+  private:
+    // Publishes this rank's record for its seq, waits until the peer published the same seq (or the
+    // next one), and returns the peer's record for that seq.
+    Record publish_and_wait(const Record& mine) {
+        const std::uint64_t seq = mine.seq;
+        block_->records[rank_][seq & 1] = mine;
         block_->published[rank_].store(seq, std::memory_order_release);
 
         const int peer = 1 - rank_;
@@ -97,38 +157,9 @@ class Lockstep {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
-        const Record theirs = block_->records[peer][seq & 1];
-        if (theirs.seq != seq || theirs.kind != mine.kind || theirs.count != mine.count ||
-            theirs.hash != mine.hash || theirs.position != mine.position) {
-            char buf[512];
-            std::snprintf(buf, sizeof(buf),
-                          "unit %llu diverged: kind %llu/%llu count %llu/%llu hash %016llx/%016llx "
-                          "position %llu/%llu (rank%d/peer)",
-                          static_cast<unsigned long long>(seq),
-                          static_cast<unsigned long long>(mine.kind),
-                          static_cast<unsigned long long>(theirs.kind),
-                          static_cast<unsigned long long>(mine.count),
-                          static_cast<unsigned long long>(theirs.count),
-                          static_cast<unsigned long long>(mine.hash),
-                          static_cast<unsigned long long>(theirs.hash),
-                          static_cast<unsigned long long>(mine.position),
-                          static_cast<unsigned long long>(theirs.position), rank_);
-            lockstep_fatal(buf);
-        }
-        return cancel_mask | theirs.cancel_mask;
+        return block_->records[peer][seq & 1];
     }
 
-    template <class T>
-    static std::uint64_t hash_tokens(std::span<const T> tokens,
-                                     std::uint64_t h = 1469598103934665603ULL) noexcept {
-        for (const T t : tokens) {
-            h ^= static_cast<std::uint32_t>(t);
-            h *= 1099511628211ULL;
-        }
-        return h;
-    }
-
-  private:
     Lockstep(int rank, const char* path) : rank_(rank) {
         if (rank_ != 0 && rank_ != 1) { lockstep_fatal("NINFER_TP_RANK must be 0 or 1"); }
         // Test hook: corrupt this rank's hash at the given unit to prove divergence is fatal.
@@ -185,6 +216,7 @@ class Lockstep {
 
     int rank_;
     std::uint64_t seq_ = 0;
+    std::uint64_t peer_pending_ = 0;
     std::uint64_t fault_unit_ = 0;
     std::chrono::seconds timeout_{300};
     SharedBlock* block_ = nullptr;
