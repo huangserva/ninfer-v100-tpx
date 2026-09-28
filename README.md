@@ -15,7 +15,7 @@ Qwen3.8-27B on Tesla V100s: rewritten sm70 attention kernels + N-GPU tensor para
 
 Head-to-head with one RTX 4090 48G (same prompts, same settings; 4090 runs stock NInfer with groupwise-int weights): decode is on par or slightly faster on the two V100s at every context (256K code 94.7 vs 80.9 tok/s, Chinese 71.0 vs 67.4), while the 4090 reads prompts about 1.85× faster (256K first token 210 s vs 393 s). Full table in the Chinese section. Decode numbers at 186K/193K are the mean of 4 seeds × 1024 generated tokens on one fixed prompt; 8K numbers are single 256-token runs. Quality: 237/300 on our public [model-evaluation](https://github.com/huangserva/model-evaluation) core-300 set versus 245 (llama.cpp Q4_K_M) and 238 (Q8_0) on a 4090, differences within noise (paired McNemar p=0.20 / p=1.0).
 
-The Volta substitutes for the hardware V100 lacks (llama.cpp's Volta flash kernel for prefill, an m8n8k4-based decode attention kernel, software NVFP4 dequant into FP16 tensor cores) come from upstream ninfer-v100. This repo rewrites the slowest of them, the INT8 decode attention kernel, retunes the prefill kernel and adds tensor parallel; the model's attention math is unchanged. What changed versus upstream is listed in [CHANGES.md](CHANGES.md); the design notes are in [docs/tp2-design-notes.md](docs/tp2-design-notes.md); the upstream README is kept as [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).
+A from-scratch install and test checklist is in [docs/reproduce.md](docs/reproduce.md); the prompt generator and benchmark scripts behind every number here are in [tools/bench/v100/](tools/bench/v100/). The Volta substitutes for the hardware V100 lacks (llama.cpp's Volta flash kernel for prefill, an m8n8k4-based decode attention kernel, software NVFP4 dequant into FP16 tensor cores) come from upstream ninfer-v100. This repo rewrites the slowest of them, the INT8 decode attention kernel, retunes the prefill kernel and adds tensor parallel; the model's attention math is unchanged. What changed versus upstream is listed in [CHANGES.md](CHANGES.md); the design notes are in [docs/tp2-design-notes.md](docs/tp2-design-notes.md); the upstream README is kept as [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).
 
 ## 这是什么
 
@@ -49,7 +49,7 @@ NInfer 官方只支持 RTX 5090。社区的 [ninfer-v100](https://github.com/geo
 | 128K | 113.9 / 109.1 | 99.8 / 105.2 | 81.1 / 83.7 | 77.6 / 78.1 | 152 s / 83 s |
 | 256K | 94.7 / 91.0 | 80.9 / 82.2 | 71.0 / 67.7 | 67.4 / 65.3 | 393 s / 210 s |
 
-生成速度双卡 V100 各档持平或略快（每轮耗时 256K 时 35 ms 对 37.7 ms），读 prompt 4090 快约 1.85 倍。
+生成速度双卡 V100 各档差不多或略快（每轮耗时 256K 时 35 ms 对 37.7 ms），读 prompt 4090 快约 1.85 倍。
 
 能力没有变化：在我们的公开题库 [model-evaluation](https://github.com/huangserva/model-evaluation) 上，双卡 nvfp4 版 300 题答对 237，以前 4090 上 llama.cpp 的 4 位版 245、8 位版 238，逐题配对比较差距在随机误差内。
 
@@ -131,7 +131,12 @@ python3 tools/tp2/tp2_proxy.py \
 - 两个进程必须用同一个随机种子（`--seed`），否则同一个概率表会抽出不同的字，核对会失败。客户端请求里带了 seed 就按客户端的来。
 - 一次只处理一个请求，最多排队 4 个（`--max-waiting`），排队超过 `--pending-timeout` 秒返回 503。
 - 两张卡各占约 20GB 显存，`--max-context 262144` 加 `--vision` 放得下。
-- 容器化部署见 `deploy/Dockerfile.tp2` 和 `deploy/start_tp2.sh`。
+- 有 NVLink 或者两卡直连正常的机器加 `--nccl-p2p auto`，让 NCCL 自己选路。默认 `off`，即给两个进程设 `NCCL_P2P_DISABLE=1`，这是开发机（直连坏掉）需要的。
+- 容器化部署见 [deploy/README.md](deploy/README.md)：先在宿主机编译，镜像只做打包。
+
+## 从零复现与测试
+
+从装依赖到跑完整套测试的清单在 [docs/reproduce.md](docs/reproduce.md)，每一步写了预期输出。成绩表里每个数字背后的 prompt 生成器和测速脚本在 [tools/bench/v100/](tools/bench/v100/)：`matrix.sh` 跑出和成绩表同样格式的表，`tp2_scenarios.py` 和 `tp2_fault.py` 是上线前过的功能测试和故障注入。
 
 ## 运行时开关
 

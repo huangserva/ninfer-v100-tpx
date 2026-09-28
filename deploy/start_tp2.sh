@@ -5,13 +5,15 @@
 #   ROOT    directory holding models-tp2/ (the two rank artifacts), api-key, logs/
 #   NAME    container name           (default ninfer-tpx)
 #   PORT    host port                (default 18881, bound to 127.0.0.1)
-#   IMAGE   image built from deploy/Dockerfile.tp2
+#   IMAGE   image built from deploy/Dockerfile
 #   MAXCTX  --max-context; 262144 fits on 2x V100 32G with --vision
+#   P2P     off (default, NCCL_P2P_DISABLE=1) or auto (NVLink / working PCIe P2P)
 set -euo pipefail
 ROOT=${ROOT:?set ROOT to the deployment directory}
 NAME=${NAME:-ninfer-tpx}
 PORT=${PORT:-18881}
-IMAGE=${IMAGE:-ninfer-v100:tpx}
+IMAGE=${IMAGE:-ninfer-v100-tpx:latest}
+P2P=${P2P:-off}
 MAXCTX=${MAXCTX:-262144}
 if docker container inspect "$NAME" >/dev/null 2>&1; then
   docker start "$NAME"; exit 0
@@ -28,7 +30,7 @@ docker run -d --name "$NAME" --restart unless-stopped --gpus '"device=0,1"' --ip
     --api-key-file /run/secrets/ninfer_api_key --log-dir /var/log/ninfer \
     --gpus 0,1 --stall-seconds 180 --lockstep-timeout 300 \
     --lockstep-file /dev/shm/ninfer_tpx_lockstep --id-file /dev/shm/ninfer_tpx.id \
-    --max-waiting 4 --pending-timeout 600 -- \
+    --max-waiting 4 --pending-timeout 600 --nccl-p2p "$P2P" -- \
     --model-id qwen38-ninfer \
     --max-context "$MAXCTX" --kv-capacity auto \
     --max-concurrency 1 --max-pending-requests 4 \

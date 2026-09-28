@@ -105,3 +105,12 @@ repository; the files under "Added" are new. Commit history is preserved (`git l
 - tests/ops/linear_add/test_nvfp4.cpp
 - tests/ops/softmax_attention/causal_cache.cpp
 - third_party/llama_cpp_fattn/fattn-mma-f16.cuh
+
+## Tooling and docs added after 42ed9995
+
+- tools/tp2/tp2_proxy.py: `--nccl-p2p {off,auto}` (default off keeps the previous behaviour, NCCL_P2P_DISABLE=1 for both ranks).
+- tools/bench/v100/ctx_prompt.py: the synthetic code / zh-doc prompt generator behind every speed number.
+- tools/bench/v100/decode_bench.py, matrix.sh: decode / first-token benchmark and the README table runner.
+- tools/bench/v100/tp2_scenarios.py, tp2_fault.py: functional scenarios and fault injection for the TP2 service.
+- deploy/Dockerfile, deploy/collect_libs.sh: runtime packaging of host-built binaries (replaces deploy/Dockerfile.tp2, whose base image was never published). The upstream root Dockerfile (CUDA 13 base, cannot target sm_70) is removed.
+- docs/reproduce.md: from-scratch install and test checklist with expected outputs.

@@ -45,8 +45,9 @@ class Supervisor:
                     "NINFER_TP_ID_FILE": self.args.id_file,
                     "NINFER_TP_LOCKSTEP_FILE": self.args.lockstep_file,
                     "NINFER_TP_LOCKSTEP_TIMEOUT_S": str(self.args.lockstep_timeout),
-                    "NINFER_TP_MAILBOX_FILE": self.args.lockstep_file + ".mailbox",
-                    "NCCL_P2P_DISABLE": "1"})
+                    "NINFER_TP_MAILBOX_FILE": self.args.lockstep_file + ".mailbox"})
+        if self.args.nccl_p2p == "off":
+            env["NCCL_P2P_DISABLE"] = "1"   # GPU-to-GPU direct access is broken on the dev machine
         if r == 1:
             for kv in self.args.rank1_env:   # test hooks only
                 k, v = kv.split("=", 1)
@@ -355,6 +356,10 @@ def main():
                     help="seconds a queued generation request may wait")
     ap.add_argument("--log-dir", default=".")
     ap.add_argument("--rank1-env", action="append", default=[], help="KEY=VAL for rank 1 (tests)")
+    ap.add_argument("--nccl-p2p", choices=["off", "auto"], default="off",
+                    help="off: export NCCL_P2P_DISABLE=1 to both ranks (default; the machine this "
+                         "was developed on has broken GPU-to-GPU direct access). auto: leave the "
+                         "decision to NCCL, for NVLink machines or a working PCIe P2P path")
     ap.add_argument("serve_args", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     a.rank_ports = [int(x) for x in a.rank_ports.split(",")]
