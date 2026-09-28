@@ -77,7 +77,11 @@ LEVELS = {
     "32K":  {"code": 124,  "zh-doc": 193},
     "128K": {"code": 473,  "zh-doc": 761},
     "186K": {"code": 722,  "zh-doc": 1162},   # the headline 186K code / 193K Chinese prompts
-    "256K": {"code": 1007, "zh-doc": 1566},
+    # 256K: matrix.sh runs this level at block offset 300000, where every block number has six
+    # digits (about 277 tokens per code block, 172 per zh-doc block), so 1007 / 1566 blocks would
+    # exceed --max-context 262144. 939 / 1516 land at about 260K, like the offset-0 prompts
+    # (1007 / 1566 blocks = 260,283 / 260,976 tokens) used for the published 256K numbers.
+    "256K": {"code": 939, "zh-doc": 1516},
 }
 
 TOK_PER_BLOCK = {"code": 258.0, "zh-doc": 166.2}   # measured at offset 0, for estimates only

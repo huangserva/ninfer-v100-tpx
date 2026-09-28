@@ -263,10 +263,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     readable, _, _ = select.select([sock], [], [], 0.5)
                     if readable and sock.recv(1, socket.MSG_PEEK) == b"":
                         cancel_state["client_gone"] = True
-                        try:
-                            conns[0].sock.shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass
+                        # rank 0 may already have finished and http.client dropped its socket
+                        s0 = conns[0].sock
+                        if s0 is not None:
+                            try:
+                                s0.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
                         return
                 except (OSError, ValueError):
                     return
