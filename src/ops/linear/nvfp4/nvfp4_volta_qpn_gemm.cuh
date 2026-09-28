@@ -374,19 +374,39 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     // eight groups' loads before decoding any of them is what keeps enough bytes in flight when K
     // per warp is short (TP2 down 5120x8704: 58.4 -> 54.5 us; gate/up half 47.9 -> 43.6 us; single
     // card 5120x17408 96.0 -> 88.4 us, all T=4).
-    constexpr int kUnroll = 8;
+    // Double-buffered on top of that: the next batch's loads are issued before the current batch
+    // is decoded, so every lane keeps one batch in flight while it computes instead of draining
+    // the pipe at each batch boundary (Nsight Compute on 2x V100-SXM2 showed the single-buffered
+    // loop at 70% DRAM throughput with long-scoreboard as the top stall).
+#ifndef NINFER_NVFP4_QPN_UNROLL
+#define NINFER_NVFP4_QPN_UNROLL 4
+#endif
+    constexpr int kUnroll = NINFER_NVFP4_QPN_UNROLL;
     int group = g0;
-    for (; group + kUnroll <= gend; group += kUnroll) {
-        uint2 qq[kUnroll];
-        std::uint8_t ss[kUnroll];
+    uint2 qq[kUnroll];
+    std::uint8_t ss[kUnroll];
+    auto load_batch = [&](int base, uint2 (&q)[kUnroll], std::uint8_t (&sc)[kUnroll]) {
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
-            const std::int64_t pi = tile_base + static_cast<std::int64_t>(group + u) * 32;
-            qq[u] = __ldg(reinterpret_cast<const uint2*>(codes + pi * 8));
-            ss[u] = __ldg(scales + pi);
+            const std::int64_t pi = tile_base + static_cast<std::int64_t>(base + u) * 32;
+            q[u]  = __ldg(reinterpret_cast<const uint2*>(codes + pi * 8));
+            sc[u] = __ldg(scales + pi);
+        }
+    };
+    if (group + kUnroll <= gend) {
+        load_batch(group, qq, ss);
+        for (; group + 2 * kUnroll <= gend; group += kUnroll) {
+            uint2 qn[kUnroll];
+            std::uint8_t sn[kUnroll];
+            load_batch(group + kUnroll, qn, sn);
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) { group_body(group + u, qq[u], ss[u]); }
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) { qq[u] = qn[u]; ss[u] = sn[u]; }
         }
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) { group_body(group + u, qq[u], ss[u]); }
+        group += kUnroll;
     }
     for (; group < gend; ++group) {
         const std::int64_t pi = tile_base + static_cast<std::int64_t>(group) * 32;

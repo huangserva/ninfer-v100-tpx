@@ -276,7 +276,15 @@ CUDA_VISIBLE_DEVICES=1 ./nvl_bench 1 & CUDA_VISIBLE_DEVICES=0 ./nvl_bench 0
 
 **另一种猜词方式 `--spec dflash2` 试不了。** 模型文件里没有它的权重（`dflash2/feature_projection` 那组张量不在 artifact 里），启动会报 `DFlash2 was selected but the artifact has no DFlash2 weight bundle`。要试得另外拿到带 dflash2 权重的 artifact 再切分。
 
-**矩阵乘内核的一次对照（没有采用）。** 双卡 down 投影（8704 到 5120）只有 160 个线程块摊 80 个 SM，试过把它从 8 路切 K 换成 16 路（`nvfp4_volta_qpn_gemm.cuh` 里 `launch_nvfp4_volta_qpn_with_activation` 的形状判断），8K 一轮反而从 22.4 涨到 22.7 毫秒，而且累加顺序变了、输出不再逐位一致，已撤回。按 nsys 的内核耗时算，fp8 那组投影已经跑到显存带宽的九成以上，nvfp4 的 MLP 在七成出头，再往上要 Nsight Compute 的计数器看瓶颈；这台机器要先开权限：`/etc/modprobe.d/` 里加 `options nvidia NVreg_RestrictProfilingToAdminUsers=0` 后重载驱动，否则 `ncu` 报 `ERR_NVGPUCTRPERM`。
+**矩阵乘内核：Nsight Compute 看到的瓶颈和两次对照。** 开计数器权限：`/etc/modprobe.d/` 里加 `options nvidia NVreg_RestrictProfilingToAdminUsers=0` 后重启，否则 `ncu` 报 `ERR_NVGPUCTRPERM`；抓法在 `~/tpx/ncu_single.sh`（单卡服务，`--kernel-name regex:volta_qpn --launch-skip 1500 --launch-count 8 --kill yes`，内核回放要备份 30GB 显存，一个内核约一分半）。在 2× V100-SXM2 上（单卡形状，解码 T=4）：
+
+| 内核 | 显存吞吐 | SM 吞吐 | 发射槽占用 | 每次发射平均等待 | 最大的等待项 |
+|---|---:|---:|---:|---:|---|
+| fp8 QPN `<1,8,1>`（注意力/GDN 投影） | 90% | 25% | 30% | 25 拍 | long scoreboard 18 拍 |
+| nvfp4 QPN prepacked `<1,16,2>`（gate_up） | 72% | 46% | 53% | 14 拍 | long scoreboard 5.4、not selected 2.2、math pipe 1.7 |
+| nvfp4 QPN prepacked `<1,8,2>`（down） | 69% | 44% | 46% | 8.7 拍 | long scoreboard 3.9 |
+
+fp8 那组纯粹在等显存，已经到头。nvfp4 那组两头都没满：解码 e2m1 和 byte_perm 的 ALU 占了一半发射槽，剩下的时间在等内存，L1 吞吐也到了 51%（激活按组重复读）。两次对照都没有明显收益：down 投影从 8 路切 K 换 16 路（一轮 22.4 到 22.7 毫秒，累加顺序变了，已撤）；主循环从"一次发 8 组再解码"改成"4 组双缓冲、解码当前批时下一批已在飞"（8K 一轮持平，186K 每轮 31.5 到 30.9 毫秒，输出逐位不变，寄存器仍 64、溢出只多 20 字节，保留了；8 组双缓冲会溢出 300 字节，不能用）。再往上要重排这个内核的解码和 MMA 分工，不是改常数能解决的。
 
 **草稿词数别动。** 在这台机器上试过把 `--draft-tokens` 从 3 调到 4、5、6：8K 代码 5 比 3 快 9%，中文慢 10%；到 128K 以上全面变慢（128K 代码 110 降到 87，186K 从 96 降到 65，每轮从 31 毫秒涨到 52 和 66），因为每轮验证的词数超过 4 之后长上下文 attention 走了慢路径。保持 3。
 
